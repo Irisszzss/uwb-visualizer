@@ -1,285 +1,454 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 
-// --- BLE CONFIGURATION ---
-const BLE_SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
-const BLE_CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+const SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+const CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
 
-const ANCHOR_1_ADDR = "1786";
-const ANCHOR_2_ADDR = "1685";
-const ANCHOR_3_ADDR = "1584";
+const A1 = "1786";
+const A2 = "1685";
+const A3 = "1584";
 
-// --- FIXED DIMENSIONS ---
-const FIXED_WIDTH = 1000;
-const FIXED_HEIGHT = 600;
+// --- TUNING ---
+const KALMAN_R = 6;
+const KALMAN_Q = 0.001;
 
-const MAX_CANVAS_PADDING = 50;
-const MIN_CANVAS_PADDING = 10;
-const PADDING_PERCENT = 0.05;
+const PEN_LENGTH_MM = 140;
+const IMU_WRITING_GAIN = 4.0; // FIXED: 1.0 for 1:1 Physical Scale
 
-const SMOOTHING_ALPHA = 0.6;
-const MOVEMENT_THRESHOLD_PX = 0.5;
+const PRESSURE_MAX = 4095;
+const PRESSURE_THRESHOLD = 200;
 
-// --- STYLES ---
-const styles = {
-  container: { minHeight: '100vh', backgroundColor: '#f1f5f9', fontFamily: 'sans-serif', padding: '20px' },
-  header: { borderBottom: '1px solid #e2e8f0', paddingBottom: '20px', marginBottom: '20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
-  card: { backgroundColor: 'white', padding: '30px', borderRadius: '20px', boxShadow: '0 10px 25px rgba(0,0,0,0.1)', maxWidth: '500px', margin: '0 auto' },
-  button: { width: '100%', padding: '12px', background: 'linear-gradient(to right, #3b82f6, #4f46e5)', color: 'white', border: 'none', borderRadius: '10px', cursor: 'pointer', fontWeight: 'bold' },
-  canvasContainer: { 
-    width: `${FIXED_WIDTH}px`, 
-    height: `${FIXED_HEIGHT}px`, 
-    backgroundColor: 'white', 
-    borderRadius: '12px', 
-    boxShadow: '0 4px 6px rgba(0,0,0,0.1)', 
-    border: '2px solid #e2e8f0', 
-    position: 'relative', 
-    overflow: 'hidden',
-    margin: '0 auto' 
-  },
-  debugBox: { marginTop: '15px', padding: '15px', backgroundColor: '#1e293b', color: '#f8fafc', borderRadius: '8px', fontSize: '12px', fontFamily: 'monospace', overflow: 'auto', maxHeight: '200px' }
-};
+// --- NEW STABILIZATION TUNING ---
+const DEADZONE_PX = 0.8;
+const SMOOTHING_SLOW = 0.15;
+const SMOOTHING_FAST = 0.8;
 
-function useUwbData() {
-  const [links, setLinks] = useState([]);
+const lerp = (start, end, amt) => (1 - amt) * start + amt * end;
+
+class KalmanFilter {
+  constructor(R = 1, Q = 1, A = 1, B = 0, C = 1) {
+    this.R = R; this.Q = Q; this.A = A; this.C = C; this.B = B;
+    this.cov = NaN; this.x = NaN;
+  }
+  filter(measurement) {
+    if (isNaN(this.x)) { this.x = measurement; this.cov = this.R; return measurement; }
+    const predX = this.A * this.x;
+    const predCov = (this.A * this.cov * this.A) + this.Q;
+    const K = predCov * this.C * (1 / ((this.C * predCov * this.C) + this.R));
+    this.x = predX + K * (measurement - (this.C * predX));
+    this.cov = predCov - (K * this.C * predCov);
+    return this.x;
+  }
+}
+
+export default function SmartStrokeDashboard() {
+  const canvasRef = useRef(null);
+  const cursorRef = useRef(null);
+  
+  // --- UI STATE ---
   const [isConnected, setIsConnected] = useState(false);
-  const bluetoothDeviceRef = useRef(null);
+  const [isCalibrated, setIsCalibrated] = useState(false);
+  const [calibStep, setCalibStep] = useState(0);
+  const [anchorMap, setAnchorMap] = useState([]);
+  
+  const [canvasDim, setCanvasDim] = useState({ w: 800, h: 600 });
+  const [pixelsPerMm, setPixelsPerMm] = useState(1);
+  
+  const [pages, setPages] = useState([[]]);
+  const [currentPageIndex, setCurrentPageIndex] = useState(0);
+  const [selectedColor, setSelectedColor] = useState('#1e3a8a');
+  const [toast, setToast] = useState({ show: false, message: '' });
+  const [uiPenData, setUiPenData] = useState({ r: 1, i: 0, j: 0, k: 0, p: 0, down: false });
 
-  const connectBluetooth = async () => {
+  // --- SENSOR REFS ---
+  const sensorDataRef = useRef({
+    links: [],
+    pen: { r: 1, i: 0, j: 0, k: 0, down: false, p: 0, np: 0 }
+  });
+  
+  const currentStrokePoints = useRef([]);
+  
+  // Stores the final "Stabilized" position used for drawing
+  const stabilizedPos = useRef({ x: 0, y: 0 });
+  
+  // --- FILTERS ---
+  const kfX = useRef(new KalmanFilter(KALMAN_R, KALMAN_Q));
+  const kfY = useRef(new KalmanFilter(KALMAN_R, KALMAN_Q));
+  const centerRef = useRef(null);
+  const lastNpSignal = useRef(0);
+  const requestRef = useRef();
+
+  // --- MATH HELPERS ---
+  const getYawPitch = (r, i, j, k) => {
+    const qr = Number(r); const qi = Number(i); const qj = Number(j); const qk = Number(k);
+    const sinp = 2 * (qr * qj - qk * qi);
+    const pitch = Math.abs(sinp) >= 1 ? (Math.sign(sinp) * Math.PI) / 2 : Math.asin(sinp);
+    const yaw = Math.atan2(2 * (qr * qk + qi * qj), 1 - 2 * (qj * qj + qk * qk));
+    return { yaw, pitch };
+  };
+
+  const angleDiff = (a, b) => {
+    let d = a - b;
+    d = ((d + Math.PI) % (2 * Math.PI)) - Math.PI;
+    return d;
+  };
+
+  const trilaterate = (d1, d2, d3, map) => {
+    if (!map || map.length < 3) return null;
+    const [x1, y1] = [map[0].x, map[0].y];
+    const [x2, y2] = [map[1].x, map[1].y];
+    const [x3, y3] = [map[2].x, map[2].y];
+    const A = 2 * (x2 - x1);
+    const B = 2 * (y2 - y1);
+    const C = d1**2 - d2**2 - x1**2 + x2**2 - y1**2 + y2**2;
+    const D = 2 * (x3 - x2);
+    const E = 2 * (y3 - y2);
+    const F = d2**2 - d3**2 - x2**2 + x3**2 - y2**2 + y3**2;
+    const denom = E * A - B * D;
+    if (Math.abs(denom) < 1e-6) return null;
+    return { x: (C * E - F * B) / denom, y: (C * D - A * F) / (B * D - A * E) };
+  };
+
+  const triggerToast = (msg) => {
+    setToast({ show: true, message: msg });
+    setTimeout(() => setToast({ show: false, message: '' }), 3000);
+  };
+
+  const connectBLE = async () => {
     try {
       const device = await navigator.bluetooth.requestDevice({
-        filters: [{ namePrefix: 'UWB' }, { services: [BLE_SERVICE_UUID] }],
-        optionalServices: [BLE_SERVICE_UUID]
+        filters: [{ namePrefix: 'UWB' }, { namePrefix: 'Smart' }],
+        optionalServices: [SERVICE_UUID]
       });
-
       const server = await device.gatt.connect();
-      const service = await server.getPrimaryService(BLE_SERVICE_UUID);
-      const characteristic = await service.getCharacteristic(BLE_CHARACTERISTIC_UUID);
-
-      bluetoothDeviceRef.current = device;
-      setIsConnected(true);
-
-      await characteristic.startNotifications();
-      characteristic.addEventListener('characteristicvaluechanged', (event) => {
-        const decoder = new TextDecoder('utf-8');
-        const jsonString = decoder.decode(event.target.value);
+      const service = await server.getPrimaryService(SERVICE_UUID);
+      const char = await service.getCharacteristic(CHARACTERISTIC_UUID);
+      await char.startNotifications();
+      
+      char.addEventListener('characteristicvaluechanged', (e) => {
+        const value = new TextDecoder().decode(e.target.value);
         try {
-          const data = JSON.parse(jsonString);
-          if (data.links) setLinks(data.links);
-        } catch (error) {
-          console.error('BLE JSON Parse Error:', error);
-        }
+          const parsed = JSON.parse(value);
+          if (parsed.links) sensorDataRef.current.links = parsed.links;
+          
+          const pressureVal = parsed.p || 0;
+          const isDown = (pressureVal > PRESSURE_THRESHOLD) || (parsed.d == 1); 
+          
+          const cleanPenData = {
+            ...parsed,
+            r: parseFloat(parsed.r || 1),
+            i: parseFloat(parsed.i || 0),
+            j: parseFloat(parsed.j || 0),
+            k: parseFloat(parsed.k || 0),
+            down: isDown
+          };
+
+          sensorDataRef.current.pen = { ...sensorDataRef.current.pen, ...cleanPenData };
+          setUiPenData(prev => ({...prev, ...cleanPenData, down: isDown}));
+
+          if (parsed.np === 1 && lastNpSignal.current === 0) {
+            setPages(prev => [...prev, []]);
+            setCurrentPageIndex(prev => prev + 1);
+            triggerToast("New Page");
+          }
+          lastNpSignal.current = parsed.np || 0;
+        } catch (err) {}
       });
-
-      device.addEventListener('gattserverdisconnected', () => {
-        setIsConnected(false);
-      });
-
-    } catch (error) {
-      console.error('Bluetooth Connection Failed:', error);
-      setIsConnected(false);
+      setIsConnected(true);
+      triggerToast("Pen Connected");
+    } catch (err) { 
+      console.error(err);
+      triggerToast("Bluetooth Error"); 
     }
   };
 
-  return { links, isConnected, connectBluetooth };
-}
-
-function trilaterate(d1, d2, d3, anchorMap) {
-  if (!anchorMap || anchorMap.length < 3) return null;
-  const [x1, y1] = [anchorMap[0].x, anchorMap[0].y];
-  const [x2, y2] = [anchorMap[1].x, anchorMap[1].y];
-  const [x3, y3] = [anchorMap[2].x, anchorMap[2].y];
-  const A = 2 * (x2 - x1);
-  const B = 2 * (y2 - y1);
-  const C = d1 * d1 - d2 * d2 - x1 * x1 + x2 * x2 - y1 * y1 + y2 * y2;
-  const D = 2 * (x3 - x2);
-  const E = 2 * (y3 - y2);
-  const F = d2 * d2 - d3 * d3 - x2 * x2 + x3 * x3 - y2 * y2 + y3 * y3;
-  const denom = E * A - B * D;
-  if (Math.abs(denom) < 1e-6) return null;
-  const x = (C * E - F * B) / denom;
-  const y = (C * D - A * F) / (B * D - A * E);
-  return { x, y };
-}
-
-function CalibrationPage({ liveData, anchorAddrs, onCalibrationComplete }) {
-  const [step, setStep] = useState('step1');
-  const [measuredDists, setMeasuredDists] = useState({ d1_a2: null, d1_a3: null, d2_a3: null });
-  const { ANCHOR_1_ADDR, ANCHOR_2_ADDR } = anchorAddrs;
-
-  const handleRecordStep1 = () => {
-    if (!liveData?.d2 || !liveData?.d3) {
-      alert("No distance data. Check anchors.");
-      return;
-    }
-    setMeasuredDists({ d1_a2: liveData.d2, d1_a3: liveData.d3, d2_a3: null });
-    setStep('step2');
+  const handleRecenter = () => {
+    const { pen } = sensorDataRef.current;
+    const { yaw, pitch } = getYawPitch(pen.r, pen.i, pen.j, pen.k);
+    centerRef.current = { yaw, pitch };
+    triggerToast("Orientation Reset");
   };
 
-  const handleRecordStep2 = () => {
-    if (!liveData?.d3) {
-      alert("No distance to Anchor 3.");
-      return;
-    }
-    const finalDists = { ...measuredDists, d2_a3: liveData.d3 };
-    const { d1_a2, d1_a3, d2_a3 } = finalDists;
-    const p_a1 = { x: 0, y: 0 };
-    const p_a2 = { x: d1_a2, y: 0 };
-    let cosA = (d1_a3**2 + d1_a2**2 - d2_a3**2) / (2 * d1_a3 * d1_a2);
-    cosA = Math.max(-1, Math.min(1, cosA)); 
-    const p_a3 = { x: d1_a3 * Math.cos(Math.acos(cosA)), y: d1_a3 * Math.sin(Math.acos(cosA)) };
-    onCalibrationComplete([p_a1, p_a2, p_a3]);
-  };
-
-  return (
-    <div style={styles.card}>
-      <h2 style={{ textAlign: 'center' }}>Calibration</h2>
-      <p style={{ color: '#64748b', marginBottom: '20px' }}>
-        Step: {step === 'step1' ? `Place tag on Anchor 1 (${ANCHOR_1_ADDR})` : `Place tag on Anchor 2 (${ANCHOR_2_ADDR})`}
-      </p>
-      <button 
-        style={styles.button} 
-        onClick={step === 'step1' ? handleRecordStep1 : handleRecordStep2}
-      >
-        Record Distances
-      </button>
-    </div>
-  );
-}
-
-function LiveCanvas({ smoothingAlpha, moveThreshold, liveData, anchorMap, isCalibrated }) {
-  const canvasRef = useRef(null);
-  const strokesRef = useRef([[]]);
-  const smoothRef = useRef({ x: 0, y: 0 });
-  const [isSmootherInitialized, setIsSmootherInitialized] = useState(false);
-
-  // MODIFIED viewTransform for Rectangular Logic
-  const viewTransform = useMemo(() => {
-    const dynamicPadding = Math.max(MIN_CANVAS_PADDING, Math.min(MAX_CANVAS_PADDING, FIXED_WIDTH * PADDING_PERCENT));
-    if (!isCalibrated || anchorMap.length < 3) return { pixelsPerMm: 0.1, originX: dynamicPadding, originY: dynamicPadding, worldWidth: 1000, worldHeight: 600 };
-    
-    const [p_a1, p_a2, p_a3] = anchorMap;
-    
-    // Rectangular width defined by distance A1 -> A2 (p_a2.x)
-    // Rectangular height defined by vertical distance to A3 (p_a3.y)
-    const worldWidth = p_a2.x;
-    const worldHeight = p_a3.y;
-
-    const scale = Math.min((FIXED_WIDTH - 2 * dynamicPadding) / worldWidth, (FIXED_HEIGHT - 2 * dynamicPadding) / worldHeight);
-    
-    return { 
-      pixelsPerMm: scale, 
-      originX: (FIXED_WIDTH - worldWidth * scale) / 2, 
-      originY: (FIXED_HEIGHT - worldHeight * scale) / 2,
-      worldWidth,
-      worldHeight
+  // --- CALIBRATION ---
+  const handleCalibration = () => {
+    const getD = (addr) => {
+      const link = sensorDataRef.current.links.find(l => l.A == addr);
+      return parseFloat(link?.R || 0) * 1000;
     };
-  }, [anchorMap, isCalibrated]);
+    const d1 = getD(A1), d2 = getD(A2), d3 = getD(A3);
 
-  const worldToScreen = (p) => ({
-    x: p.x * viewTransform.pixelsPerMm + viewTransform.originX,
-    y: p.y * viewTransform.pixelsPerMm + viewTransform.originY,
-  });
+    if (calibStep === 0) {
+      setAnchorMap([{ x: 0, y: 0 }, { d1_a2: d2, d1_a3: d3 }]);
+      setCalibStep(1);
+      triggerToast("Origin Fixed. Tap Anchor 2.");
+    } else {
+      const { d1_a2, d1_a3 } = anchorMap[1];
+      const p_a1 = { x: 0, y: 0 };
+      const p_a2 = { x: d1_a2, y: 0 }; 
+      let cosA = (d1_a3**2 + d1_a2**2 - d3**2) / (2 * d1_a3 * d1_a2);
+      const p_a3 = { x: d1_a3 * cosA, y: d1_a3 * Math.sin(Math.acos(Math.max(-1, Math.min(1, cosA)))) };
+      
+      const realWidthMM = p_a2.x; 
+      const realHeightMM = Math.abs(p_a3.y);
 
-  const anchorPixels = useMemo(() => anchorMap.map(worldToScreen), [anchorMap, viewTransform]);
+      const targetCanvasWidthPX = 1000; 
+      const ratio = targetCanvasWidthPX / realWidthMM;
+      const targetCanvasHeightPX = realHeightMM * ratio;
 
-  const draw = () => {
-    const ctx = canvasRef.current?.getContext('2d');
-    if (!ctx) return;
-    ctx.clearRect(0, 0, FIXED_WIDTH, FIXED_HEIGHT);
-    
-    if (isCalibrated) {
-      // Draw Writable Rect Boundary
-      ctx.strokeStyle = '#e2e8f0';
-      ctx.setLineDash([5, 5]);
-      ctx.strokeRect(viewTransform.originX, viewTransform.originY, viewTransform.worldWidth * viewTransform.pixelsPerMm, viewTransform.worldHeight * viewTransform.pixelsPerMm);
-      ctx.setLineDash([]);
+      setCanvasDim({ w: targetCanvasWidthPX, h: targetCanvasHeightPX });
+      setPixelsPerMm(ratio); 
 
-      anchorPixels.forEach((a, i) => {
-        ctx.beginPath(); ctx.arc(a.x, a.y, 6, 0, Math.PI * 2); ctx.fillStyle = '#22c55e'; ctx.fill();
-        ctx.fillStyle = 'black'; ctx.fillText(`A${i+1}`, a.x + 8, a.y);
-      });
+      setAnchorMap([p_a1, p_a2, p_a3]);
+      setIsCalibrated(true);
+      setCalibStep(2);
+      triggerToast(`Calibrated! Scale: ${ratio.toFixed(2)} px/mm`);
     }
-    
-    ctx.lineWidth = 3; ctx.strokeStyle = 'magenta'; ctx.lineCap = 'round';
-    strokesRef.current.forEach(s => {
-      if (s.length < 2) return;
-      ctx.beginPath(); ctx.moveTo(s[0].x, s[0].y);
-      for (let i = 1; i < s.length; i++) ctx.lineTo(s[i].x, s[i].y);
-      ctx.stroke();
-    });
+  };
+
+  // --- RENDER LOOP ---
+  const animate = () => {
+    if (isCalibrated && canvasRef.current && cursorRef.current && anchorMap.length === 3) {
+      const ctx = canvasRef.current.getContext('2d');
+      const cCtx = cursorRef.current.getContext('2d');
+      const { links, pen } = sensorDataRef.current;
+      
+      const getD = (addr) => {
+        const link = links.find(l => l.A == addr);
+        return parseFloat(link?.R || 0) * 1000;
+      };
+      
+      // 1. UWB Calculation
+      const worldPos = trilaterate(getD(A1), getD(A2), getD(A3), anchorMap);
+
+      if (worldPos) {
+        // 2. Convert to Pixels
+        const rawUwbX = worldPos.x * pixelsPerMm;
+        const rawUwbY = worldPos.y * pixelsPerMm;
+
+        // 3. Filter UWB
+        const stableX = kfX.current.filter(rawUwbX);
+        const stableY = kfY.current.filter(rawUwbY);
+
+        // 4. IMU Logic
+        const { yaw, pitch } = getYawPitch(pen.r, pen.i, pen.j, pen.k);
+        if (!centerRef.current) centerRef.current = { yaw, pitch };
+
+        const dYaw = angleDiff(yaw, centerRef.current.yaw);
+        const dPitch = angleDiff(pitch, centerRef.current.pitch);
+
+        // FIXED SCALE LOGIC: Multiply by pixelsPerMm!
+        const mmOffsetX = -Math.sin(dYaw) * PEN_LENGTH_MM * IMU_WRITING_GAIN;
+        const mmOffsetY = -Math.sin(dPitch) * PEN_LENGTH_MM * IMU_WRITING_GAIN;
+
+        const pixelOffsetX = mmOffsetX * pixelsPerMm;
+        const pixelOffsetY = mmOffsetY * pixelsPerMm;
+
+        // 5. Target Calculation (Fusion)
+        const targetX = stableX + pixelOffsetX;
+        const targetY = stableY + pixelOffsetY;
+        
+        // --- 6. ADAPTIVE STABILIZATION (THE DRIFT FIX) ---
+        const dist = Math.hypot(targetX - stabilizedPos.current.x, targetY - stabilizedPos.current.y);
+
+        let finalX, finalY;
+
+        if (dist < DEADZONE_PX) {
+           finalX = stabilizedPos.current.x;
+           finalY = stabilizedPos.current.y;
+        } else {
+           const dynamicAlpha = Math.min(SMOOTHING_FAST, Math.max(SMOOTHING_SLOW, (dist / 10)));
+           finalX = lerp(stabilizedPos.current.x, targetX, dynamicAlpha);
+           finalY = lerp(stabilizedPos.current.y, targetY, dynamicAlpha);
+        }
+
+        stabilizedPos.current = { x: finalX, y: finalY };
+
+        const x = Math.max(0, Math.min(finalX, canvasDim.w));
+        const y = Math.max(0, Math.min(finalY, canvasDim.h));
+
+        // 7. Draw
+        if (pen.down) {
+          ctx.strokeStyle = selectedColor;
+          ctx.lineCap = 'round';
+          ctx.lineJoin = 'round';
+          const pressureWeight = pen.p / PRESSURE_MAX;
+          ctx.lineWidth = 1 + (pressureWeight * 3); 
+
+          currentStrokePoints.current.push({ x, y, p: pen.p, color: selectedColor });
+
+          const points = currentStrokePoints.current;
+          if (points.length > 2) {
+            const last = points[points.length - 1];
+            const prev = points[points.length - 2];
+            const prev2 = points[points.length - 3];
+            
+            const midX = (prev.x + last.x) / 2;
+            const midY = (prev.y + last.y) / 2;
+            const prevMidX = (prev2.x + prev.x) / 2;
+            const prevMidY = (prev2.y + prev.y) / 2;
+
+            ctx.beginPath();
+            ctx.moveTo(prevMidX, prevMidY);
+            ctx.quadraticCurveTo(prev.x, prev.y, midX, midY);
+            ctx.stroke();
+          } else if (points.length === 2) {
+             ctx.beginPath();
+             ctx.moveTo(points[0].x, points[0].y);
+             ctx.lineTo(points[1].x, points[1].y);
+             ctx.stroke();
+          }
+        } else {
+          if (currentStrokePoints.current.length > 0) {
+            const strokeCopy = [...currentStrokePoints.current];
+            setPages(prev => {
+              const updated = [...prev];
+              updated[currentPageIndex] = [...(updated[currentPageIndex] || []), { points: strokeCopy, color: selectedColor }];
+              return updated;
+            });
+            currentStrokePoints.current = [];
+          }
+        }
+
+        // 8. Cursor
+        cCtx.clearRect(0, 0, canvasDim.w, canvasDim.h);
+        
+        cCtx.beginPath();
+        cCtx.arc(stableX, stableY, 3, 0, Math.PI * 2);
+        cCtx.fillStyle = '#94a3b8'; 
+        cCtx.fill();
+
+        cCtx.beginPath();
+        cCtx.moveTo(stableX, stableY);
+        cCtx.lineTo(x, y);
+        cCtx.strokeStyle = 'rgba(0,0,0,0.15)';
+        cCtx.stroke();
+        
+        cCtx.beginPath();
+        const cursorRadius = pen.down ? 3 : 5; 
+        cCtx.arc(x, y, cursorRadius, 0, Math.PI * 2);
+        cCtx.fillStyle = pen.down ? selectedColor : '#f97316'; 
+        cCtx.fill();
+        cCtx.strokeStyle = 'white'; 
+        cCtx.lineWidth = 2; 
+        cCtx.stroke();
+      }
+    }
+    requestRef.current = requestAnimationFrame(animate);
   };
 
   useEffect(() => {
-    if (!isCalibrated || !liveData?.pos_mm) { draw(); return; }
-    
-    const pos_px = worldToScreen(liveData.pos_mm);
-    
-    // RECTANGULAR CHECK: Replace pointInTriangle with X/Y Bounds
-    const isInside = 
-        liveData.pos_mm.x >= 0 && 
-        liveData.pos_mm.x <= viewTransform.worldWidth &&
-        liveData.pos_mm.y >= 0 &&
-        liveData.pos_mm.y <= viewTransform.worldHeight;
+    requestRef.current = requestAnimationFrame(animate);
+    return () => cancelAnimationFrame(requestRef.current);
+  }, [isCalibrated, canvasDim, selectedColor, currentPageIndex, anchorMap, pixelsPerMm]); 
 
-    if (!isSmootherInitialized) { smoothRef.current = pos_px; setIsSmootherInitialized(true); }
-    const old = smoothRef.current;
-    smoothRef.current = { x: smoothingAlpha * pos_px.x + (1 - smoothingAlpha) * old.x, y: smoothingAlpha * pos_px.y + (1 - smoothingAlpha) * old.y };
-    
-    if (Math.hypot(smoothRef.current.x - old.x, smoothRef.current.y - old.y) > moveThreshold && isInside) {
-      strokesRef.current[strokesRef.current.length - 1].push({ ...smoothRef.current });
+  // Page Redraw Logic
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (canvas && isCalibrated) {
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvasDim.w, canvasDim.h);
+      const pageStrokes = pages[currentPageIndex] || [];
+      
+      pageStrokes.forEach(stroke => {
+        if (!stroke.points || stroke.points.length < 2) return;
+        ctx.beginPath();
+        ctx.strokeStyle = stroke.color;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
+        for (let i = 1; i < stroke.points.length - 1; i++) {
+           const p1 = stroke.points[i];
+           const p2 = stroke.points[i + 1];
+           const midX = (p1.x + p2.x) / 2;
+           const midY = (p1.y + p2.y) / 2;
+           const pWeight = p1.p / PRESSURE_MAX;
+           ctx.lineWidth = 1 + (pWeight * 3);
+           ctx.quadraticCurveTo(p1.x, p1.y, midX, midY);
+        }
+        const last = stroke.points[stroke.points.length-1];
+        ctx.lineTo(last.x, last.y);
+        ctx.stroke();
+      });
     }
-    draw();
-  }, [liveData, isCalibrated]);
+  }, [currentPageIndex, isCalibrated, canvasDim, pages]);
 
   return (
-    <div style={styles.canvasContainer}>
-      <canvas ref={canvasRef} width={FIXED_WIDTH} height={FIXED_HEIGHT} />
-      <button onClick={() => { strokesRef.current = [[]]; draw(); }} style={{ position: 'absolute', bottom: '10px', right: '10px' }}>Clear</button>
-    </div>
-  );
-}
+    <div className="flex h-screen w-screen bg-slate-200 overflow-hidden font-['Poppins'] select-none">
+      <aside className="w-72 bg-white border-r border-slate-300 p-6 flex flex-col shadow-lg z-50 overflow-y-auto">
+        <h1 className="text-2xl font-black text-slate-900 mb-8 tracking-tighter italic">SMART<span className="text-blue-600">STROKE</span></h1>
 
-export default function App() {
-  const { links, isConnected, connectBluetooth } = useUwbData();
-  const [isCalibrated, setIsCalibrated] = useState(false);
-  const [anchorMap, setAnchorMap] = useState([]);
+        <div className="space-y-4">
+          <button onClick={connectBLE} className={`w-full p-4 rounded-2xl font-bold transition-all ${isConnected ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-400 border border-slate-200'}`}>
+            {isConnected ? '● CONNECTED' : 'CONNECT PEN'}
+          </button>
 
-  const liveData = useMemo(() => {
-    const getD = (addr) => parseFloat(links.find(l => l.A === addr)?.R) * 1000;
-    const d = { d1: getD(ANCHOR_1_ADDR), d2: getD(ANCHOR_2_ADDR), d3: getD(ANCHOR_3_ADDR) };
-    if (!d.d1 || !d.d2 || !d.d3 || !isCalibrated) return { ...d, pos_mm: null };
-    return { ...d, pos_mm: trilaterate(d.d1, d.d2, d.d3, anchorMap) };
-  }, [links, anchorMap, isCalibrated]);
+          {isConnected && (
+            <button onClick={handleRecenter} className="w-full p-3 bg-blue-50 text-blue-700 rounded-xl font-bold text-xs border border-blue-200 hover:bg-blue-100">
+               RESET ORIENTATION
+            </button>
+          )}
 
-  return (
-    <div style={styles.container}>
-      <header style={styles.header}>
-        <div style={{flex: 1}}>
-          <h1 style={{margin: 0}}>UWB Whiteboard</h1>
-          <p style={{ color: isConnected ? 'green' : 'red', margin: 0 }}>{isConnected ? '● Connected' : '○ Disconnected'}</p>
-        </div>
-        {!isConnected && (
-           <button style={{...styles.button, width: 'auto', padding: '10px 20px'}} onClick={connectBluetooth}>
-             Connect Bluetooth
-           </button>
-        )}
-      </header>
-      {!isCalibrated ? (
-        <CalibrationPage liveData={liveData} anchorAddrs={{ ANCHOR_1_ADDR, ANCHOR_2_ADDR }} onCalibrationComplete={(map) => { setAnchorMap(map); setIsCalibrated(true); }} />
-      ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '20px' }}>
-          <LiveCanvas smoothingAlpha={SMOOTHING_ALPHA} moveThreshold={MOVEMENT_THRESHOLD_PX} liveData={liveData} anchorMap={anchorMap} isCalibrated={isCalibrated} />
-          <div style={{ ...styles.debugBox, width: `${FIXED_WIDTH}px` }}>
-            <pre>{JSON.stringify({ liveData, links }, null, 2)}</pre>
-            <button onClick={() => setIsCalibrated(false)}>Reset Calibration</button>
+          <div className="bg-slate-50 p-4 rounded-2xl border border-slate-200">
+             <h3 className="text-[10px] font-black text-slate-500 uppercase mb-3 text-center">Surface Mapping</h3>
+             {!isCalibrated ? (
+               <button onClick={handleCalibration} disabled={!isConnected} className="w-full p-3 bg-slate-900 text-white rounded-xl font-bold text-xs hover:bg-black">
+                 {calibStep === 0 ? "1. CALIBRATE ORIGIN" : "2. CALIBRATE WIDTH"}
+               </button>
+             ) : (
+               <div className="text-center">
+                 <div className="text-[10px] text-blue-600 font-bold mb-1 uppercase">
+                    Scale: {pixelsPerMm.toFixed(3)} px/mm <br/>
+                    Canvas: {canvasDim.w}x{Math.round(canvasDim.h)}px
+                 </div>
+                 <button onClick={() => {setIsCalibrated(false); setCalibStep(0);}} className="text-[10px] text-slate-400 underline">Reset</button>
+               </div>
+             )}
           </div>
+
+          <div className="bg-slate-900 p-4 rounded-2xl flex flex-col items-center">
+             <h3 className="text-[10px] font-black text-slate-500 uppercase mb-4">IMU Telemetry</h3>
+             <div className="w-16 h-16 bg-blue-600 rounded-lg shadow-2xl transition-transform duration-100 ease-linear border border-white/20"
+                  style={{ transform: `rotateX(${uiPenData.j * 90}deg) rotateY(${uiPenData.i * 90}deg)` }} />
+             <div className="mt-4 w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
+                <div className="bg-blue-400 h-full transition-all duration-75" 
+                     style={{ width: `${(uiPenData.p / PRESSURE_MAX) * 100}%` }} />
+             </div>
+          </div>
+          <div className="flex justify-center gap-3">
+             {['#1e3a8a', '#f97316', '#ef4444', '#22c55e', '#000000'].map(c => (
+               <button key={c} onClick={() => setSelectedColor(c)} className={`w-8 h-8 rounded-full border-4 ${selectedColor === c ? 'border-blue-200 scale-125' : 'border-transparent'}`} style={{backgroundColor: c}} />
+             ))}
+           </div>
+        </div>
+      </aside>
+
+      <main className="flex-1 relative flex flex-col items-center justify-center p-12 bg-slate-100 overflow-auto">
+        <div className="relative bg-white shadow-[0_0_60px_rgba(0,0,0,0.15)] border-[12px] border-slate-900 flex-shrink-0" 
+             style={{ 
+               width: `${canvasDim.w}px`, 
+               height: `${canvasDim.h}px`, 
+               backgroundImage: `radial-gradient(#e2e8f0 1.5px, transparent 1.5px)`,
+               backgroundSize: '30px 30px' 
+             }}>
+          
+          <canvas ref={canvasRef} width={canvasDim.w} height={canvasDim.h} className="absolute inset-0" />
+          <canvas ref={cursorRef} width={canvasDim.w} height={canvasDim.h} className="absolute inset-0 z-10 pointer-events-none" />
+          
+          {!isCalibrated && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-white/95 z-20">
+               <div className="p-12 border-4 border-slate-900 text-center">
+                 <div className="text-slate-900 font-black text-4xl uppercase tracking-tighter mb-4">Surface Locked</div>
+                 <p className="text-slate-500">Run calibration to set workspace dimensions</p>
+               </div>
+            </div>
+          )}
+        </div>
+      </main>
+      
+      {toast.show && (
+        <div className="fixed bottom-8 right-8 bg-slate-900 text-white px-6 py-3 rounded-full font-bold shadow-2xl z-[100] animate-in fade-in slide-in-from-bottom-4">
+          {toast.message}
         </div>
       )}
-      <style>{`
-        body { margin: 0; }
-        button { padding: 8px 16px; cursor: pointer; border-radius: 4px; border: 1px solid #ccc; background: white; }
-        button:hover { background: #f8fafc; }
-      `}</style>
     </div>
   );
 }
