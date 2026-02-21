@@ -9,8 +9,8 @@ const A3 = "1584";
 
 // --- TUNING ---
 const KALMAN_R = 6;
-const KALMAN_Q = 0.005; // Slightly increased for better hover tracking
-const UWB_LOCKED_Q = 0.0001; // Ultra-stiff for writing stability
+const KALMAN_Q = 0.005; 
+const UWB_LOCKED_Q = 0.0001; 
 
 const PEN_LENGTH_MM = 140;
 const IMU_WRITING_GAIN = 4.0; 
@@ -37,7 +37,6 @@ class KalmanFilter {
   }
 }
 
-// New filter specifically for removing IMU micro-tremors and jaggedness
 class EMAFilter {
   constructor(alpha) { this.alpha = alpha; this.value = null; }
   filter(val) {
@@ -79,11 +78,12 @@ export default function SmartStrokeDashboard() {
   // --- FILTER REFS ---
   const kfX = useRef(new KalmanFilter(KALMAN_R, KALMAN_Q));
   const kfY = useRef(new KalmanFilter(KALMAN_R, KALMAN_Q));
-  const imuXFilter = useRef(new EMAFilter(0.4)); // Smooths X jaggedness
-  const imuYFilter = useRef(new EMAFilter(0.4)); // Smooths Y jaggedness
+  const imuXFilter = useRef(new EMAFilter(0.4)); 
+  const imuYFilter = useRef(new EMAFilter(0.4)); 
   
   const centerRef = useRef(null);
   const lastNpSignal = useRef(0);
+  const lastPenUpTime = useRef(0); // <-- NEW: Tracks hover time between strokes
   const requestRef = useRef();
 
   // --- MATH HELPERS ---
@@ -129,6 +129,10 @@ export default function SmartStrokeDashboard() {
         optionalServices: [SERVICE_UUID]
       });
       const server = await device.gatt.connect();
+      
+      // Delay to prevent GATT crash
+      await new Promise(resolve => setTimeout(resolve, 500));
+
       const service = await server.getPrimaryService(SERVICE_UUID);
       const char = await service.getCharacteristic(CHARACTERISTIC_UUID);
       await char.startNotifications();
@@ -179,7 +183,6 @@ export default function SmartStrokeDashboard() {
     triggerToast("Orientation Reset");
   };
 
-  // --- CALIBRATION ---
   const handleCalibration = () => {
     const getD = (addr) => {
       const link = sensorDataRef.current.links.find(l => l.A == addr);
@@ -215,7 +218,6 @@ export default function SmartStrokeDashboard() {
     }
   };
 
-  // --- RENDER LOOP ---
   const animate = () => {
     if (isCalibrated && canvasRef.current && cursorRef.current && anchorMap.length === 3) {
       const ctx = canvasRef.current.getContext('2d');
@@ -227,43 +229,45 @@ export default function SmartStrokeDashboard() {
         return parseFloat(link?.R || 0) * 1000;
       };
       
-      // 1. UWB Calculation
       const worldPos = trilaterate(getD(A1), getD(A2), getD(A3), anchorMap);
 
       if (worldPos) {
-        // 2. Convert to Pixels
         const rawUwbX = worldPos.x * pixelsPerMm;
         const rawUwbY = worldPos.y * pixelsPerMm;
 
-        // --- FIX: SPATIAL STICKY ANCHORING ---
-        // Calculate how far the raw UWB is from our current stable cursor
+        // --- FIX: CONTINUOUS IMU ANCHORING (Time + Spatial) ---
+        const now = performance.now();
+        if (pen.down) {
+            lastPenUpTime.current = 0;
+        } else if (lastPenUpTime.current === 0) {
+            lastPenUpTime.current = now;
+        }
+        const timeSincePenUp = lastPenUpTime.current === 0 ? 0 : (now - lastPenUpTime.current);
+
         const currentX = kfX.current.x || rawUwbX;
         const currentY = kfY.current.x || rawUwbY;
-        const distFromStable = Math.hypot(rawUwbX - currentX, rawUwbY - currentY);
-        const distMm = distFromStable / pixelsPerMm;
+        const distMm = Math.hypot(rawUwbX - currentX, rawUwbY - currentY) / pixelsPerMm;
 
-        // Determine how "stiff" the UWB should be
+        // Same letter if pen has been lifted < 750ms AND hand hasn't moved > 20mm
+        const isSameLetter = !pen.down && timeSincePenUp < 750 && distMm < 20;
+
         let dynamicQ;
-        if (pen.down) {
-            dynamicQ = UWB_LOCKED_Q; // 1. Writing: Ultra stiff, locked in place
-        } else if (distMm < 25) {
-            dynamicQ = 0.0005;       // 2. Hovering near last stroke (like the 'k'): Keep it very stiff!
+        if (pen.down || isSameLetter) {
+            dynamicQ = UWB_LOCKED_Q; // 1. Writing/Hovering inside a letter: Lock base completely
         } else {
-            dynamicQ = KALMAN_Q;     // 3. Moving far away (new word): Let it catch up quickly
+            dynamicQ = KALMAN_Q;     // 2. Moving to next word: Unlock to catch up
         }
 
         kfX.current.Q = dynamicQ;
         kfY.current.Q = dynamicQ;
 
-        // 3. Filter UWB
         const stableX = kfX.current.filter(rawUwbX);
         const stableY = kfY.current.filter(rawUwbY);
 
-        // 4. IMU Logic
         const { yaw, pitch } = getYawPitch(pen.r, pen.i, pen.j, pen.k);
         
-        // Reset anchor and clear internal filters when lifting pen
-        if (!centerRef.current || !pen.down) {
+        // --- DO NOT reset anchor if we are drawing the same letter! ---
+        if (!centerRef.current || (!pen.down && !isSameLetter)) {
           centerRef.current = { yaw, pitch };
           imuXFilter.current.reset();
           imuYFilter.current.reset();
@@ -275,20 +279,17 @@ export default function SmartStrokeDashboard() {
         let rawOffsetX = -Math.sin(dYaw) * PEN_LENGTH_MM * IMU_WRITING_GAIN * pixelsPerMm;
         let rawOffsetY = -Math.sin(dPitch) * PEN_LENGTH_MM * IMU_WRITING_GAIN * pixelsPerMm;
 
-        // Smooth out the high-frequency IMU noise before it reaches the canvas
         const pixelOffsetX = imuXFilter.current.filter(rawOffsetX);
         const pixelOffsetY = imuYFilter.current.filter(rawOffsetY);
 
-        // 5. Target Calculation (Fusion)
         const targetX = stableX + pixelOffsetX;
         const targetY = stableY + pixelOffsetY;
         
-        // 6. Fluid Stabilization
-        const smoothingAlpha = pen.down ? 0.35 : 0.7; // Smooth ink, fast hover
+        const smoothingAlpha = pen.down ? 0.35 : 0.7;
         let finalX, finalY;
 
         if (stabilizedPos.current.x === 0 && stabilizedPos.current.y === 0) {
-           finalX = targetX; finalY = targetY; // Initial snap
+           finalX = targetX; finalY = targetY; 
         } else {
            finalX = lerp(stabilizedPos.current.x, targetX, smoothingAlpha);
            finalY = lerp(stabilizedPos.current.y, targetY, smoothingAlpha);
@@ -299,7 +300,6 @@ export default function SmartStrokeDashboard() {
         const x = Math.max(0, Math.min(finalX, canvasDim.w));
         const y = Math.max(0, Math.min(finalY, canvasDim.h));
 
-        // 7. Draw
         if (pen.down) {
           ctx.strokeStyle = selectedColor;
           ctx.lineCap = 'round';
@@ -342,7 +342,6 @@ export default function SmartStrokeDashboard() {
           }
         }
 
-        // 8. Cursor
         cCtx.clearRect(0, 0, canvasDim.w, canvasDim.h);
         
         cCtx.beginPath();
@@ -374,7 +373,6 @@ export default function SmartStrokeDashboard() {
     return () => cancelAnimationFrame(requestRef.current);
   }, [isCalibrated, canvasDim, selectedColor, currentPageIndex, anchorMap, pixelsPerMm]); 
 
-  // Page Redraw Logic
   useEffect(() => {
     const canvas = canvasRef.current;
     if (canvas && isCalibrated) {
