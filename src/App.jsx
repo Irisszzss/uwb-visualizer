@@ -230,7 +230,11 @@ export default function SmartStrokeDashboard() {
 
         // 4. IMU Logic
         const { yaw, pitch } = getYawPitch(pen.r, pen.i, pen.j, pen.k);
-        if (!centerRef.current) centerRef.current = { yaw, pitch };
+        
+        // --- THE FIX: Continuously reset center orientation while pen is up ---
+        if (!centerRef.current || !pen.down) {
+          centerRef.current = { yaw, pitch };
+        }
 
         const dYaw = angleDiff(yaw, centerRef.current.yaw);
         const dPitch = angleDiff(pitch, centerRef.current.pitch);
