@@ -222,11 +222,6 @@ export default function SmartStrokeDashboard() {
       const cCtx = cursorRef.current.getContext('2d');
       const { links, pen } = sensorDataRef.current;
       
-      // FIX 1: DYNAMIC UWB ANCHORING
-      // Lock UWB coordinates in place while writing to prevent letter drift.
-      kfX.current.Q = pen.down ? UWB_LOCKED_Q : KALMAN_Q;
-      kfY.current.Q = pen.down ? UWB_LOCKED_Q : KALMAN_Q;
-
       const getD = (addr) => {
         const link = links.find(l => l.A == addr);
         return parseFloat(link?.R || 0) * 1000;
@@ -239,6 +234,26 @@ export default function SmartStrokeDashboard() {
         // 2. Convert to Pixels
         const rawUwbX = worldPos.x * pixelsPerMm;
         const rawUwbY = worldPos.y * pixelsPerMm;
+
+        // --- FIX: SPATIAL STICKY ANCHORING ---
+        // Calculate how far the raw UWB is from our current stable cursor
+        const currentX = kfX.current.x || rawUwbX;
+        const currentY = kfY.current.x || rawUwbY;
+        const distFromStable = Math.hypot(rawUwbX - currentX, rawUwbY - currentY);
+        const distMm = distFromStable / pixelsPerMm;
+
+        // Determine how "stiff" the UWB should be
+        let dynamicQ;
+        if (pen.down) {
+            dynamicQ = UWB_LOCKED_Q; // 1. Writing: Ultra stiff, locked in place
+        } else if (distMm < 25) {
+            dynamicQ = 0.0005;       // 2. Hovering near last stroke (like the 'k'): Keep it very stiff!
+        } else {
+            dynamicQ = KALMAN_Q;     // 3. Moving far away (new word): Let it catch up quickly
+        }
+
+        kfX.current.Q = dynamicQ;
+        kfY.current.Q = dynamicQ;
 
         // 3. Filter UWB
         const stableX = kfX.current.filter(rawUwbX);
@@ -260,7 +275,6 @@ export default function SmartStrokeDashboard() {
         let rawOffsetX = -Math.sin(dYaw) * PEN_LENGTH_MM * IMU_WRITING_GAIN * pixelsPerMm;
         let rawOffsetY = -Math.sin(dPitch) * PEN_LENGTH_MM * IMU_WRITING_GAIN * pixelsPerMm;
 
-        // FIX 2: IMU EMA FILTERING
         // Smooth out the high-frequency IMU noise before it reaches the canvas
         const pixelOffsetX = imuXFilter.current.filter(rawOffsetX);
         const pixelOffsetY = imuYFilter.current.filter(rawOffsetY);
@@ -269,8 +283,7 @@ export default function SmartStrokeDashboard() {
         const targetX = stableX + pixelOffsetX;
         const targetY = stableY + pixelOffsetY;
         
-        // FIX 3: FLUID STABILIZATION
-        // Replaced jittery distance checks with a consistent, buttery low-pass lerp.
+        // 6. Fluid Stabilization
         const smoothingAlpha = pen.down ? 0.35 : 0.7; // Smooth ink, fast hover
         let finalX, finalY;
 
