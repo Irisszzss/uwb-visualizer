@@ -9,21 +9,18 @@ const A3 = "1584";
 
 // --- TUNING ---
 const KALMAN_R = 6;
-const KALMAN_Q = 0.001;
+const KALMAN_Q = 0.005; // Slightly increased for better hover tracking
+const UWB_LOCKED_Q = 0.0001; // Ultra-stiff for writing stability
 
 const PEN_LENGTH_MM = 140;
-const IMU_WRITING_GAIN = 4.0; // FIXED: 1.0 for 1:1 Physical Scale
+const IMU_WRITING_GAIN = 4.0; 
 
 const PRESSURE_MAX = 4095;
 const PRESSURE_THRESHOLD = 200;
 
-// --- NEW STABILIZATION TUNING ---
-const DEADZONE_PX = 0.8;
-const SMOOTHING_SLOW = 0.15;
-const SMOOTHING_FAST = 0.8;
-
 const lerp = (start, end, amt) => (1 - amt) * start + amt * end;
 
+// --- FILTERS ---
 class KalmanFilter {
   constructor(R = 1, Q = 1, A = 1, B = 0, C = 1) {
     this.R = R; this.Q = Q; this.A = A; this.C = C; this.B = B;
@@ -38,6 +35,17 @@ class KalmanFilter {
     this.cov = predCov - (K * this.C * predCov);
     return this.x;
   }
+}
+
+// New filter specifically for removing IMU micro-tremors and jaggedness
+class EMAFilter {
+  constructor(alpha) { this.alpha = alpha; this.value = null; }
+  filter(val) {
+    if (this.value === null) { this.value = val; return val; }
+    this.value = this.value + this.alpha * (val - this.value);
+    return this.value;
+  }
+  reset() { this.value = null; }
 }
 
 export default function SmartStrokeDashboard() {
@@ -66,13 +74,14 @@ export default function SmartStrokeDashboard() {
   });
   
   const currentStrokePoints = useRef([]);
-  
-  // Stores the final "Stabilized" position used for drawing
   const stabilizedPos = useRef({ x: 0, y: 0 });
   
-  // --- FILTERS ---
+  // --- FILTER REFS ---
   const kfX = useRef(new KalmanFilter(KALMAN_R, KALMAN_Q));
   const kfY = useRef(new KalmanFilter(KALMAN_R, KALMAN_Q));
+  const imuXFilter = useRef(new EMAFilter(0.4)); // Smooths X jaggedness
+  const imuYFilter = useRef(new EMAFilter(0.4)); // Smooths Y jaggedness
+  
   const centerRef = useRef(null);
   const lastNpSignal = useRef(0);
   const requestRef = useRef();
@@ -165,6 +174,8 @@ export default function SmartStrokeDashboard() {
     const { pen } = sensorDataRef.current;
     const { yaw, pitch } = getYawPitch(pen.r, pen.i, pen.j, pen.k);
     centerRef.current = { yaw, pitch };
+    imuXFilter.current.reset();
+    imuYFilter.current.reset();
     triggerToast("Orientation Reset");
   };
 
@@ -211,6 +222,11 @@ export default function SmartStrokeDashboard() {
       const cCtx = cursorRef.current.getContext('2d');
       const { links, pen } = sensorDataRef.current;
       
+      // FIX 1: DYNAMIC UWB ANCHORING
+      // Lock UWB coordinates in place while writing to prevent letter drift.
+      kfX.current.Q = pen.down ? UWB_LOCKED_Q : KALMAN_Q;
+      kfY.current.Q = pen.down ? UWB_LOCKED_Q : KALMAN_Q;
+
       const getD = (addr) => {
         const link = links.find(l => l.A == addr);
         return parseFloat(link?.R || 0) * 1000;
@@ -231,37 +247,38 @@ export default function SmartStrokeDashboard() {
         // 4. IMU Logic
         const { yaw, pitch } = getYawPitch(pen.r, pen.i, pen.j, pen.k);
         
-        // --- THE FIX: Continuously reset center orientation while pen is up ---
+        // Reset anchor and clear internal filters when lifting pen
         if (!centerRef.current || !pen.down) {
           centerRef.current = { yaw, pitch };
+          imuXFilter.current.reset();
+          imuYFilter.current.reset();
         }
 
         const dYaw = angleDiff(yaw, centerRef.current.yaw);
         const dPitch = angleDiff(pitch, centerRef.current.pitch);
 
-        // FIXED SCALE LOGIC: Multiply by pixelsPerMm!
-        const mmOffsetX = -Math.sin(dYaw) * PEN_LENGTH_MM * IMU_WRITING_GAIN;
-        const mmOffsetY = -Math.sin(dPitch) * PEN_LENGTH_MM * IMU_WRITING_GAIN;
+        let rawOffsetX = -Math.sin(dYaw) * PEN_LENGTH_MM * IMU_WRITING_GAIN * pixelsPerMm;
+        let rawOffsetY = -Math.sin(dPitch) * PEN_LENGTH_MM * IMU_WRITING_GAIN * pixelsPerMm;
 
-        const pixelOffsetX = mmOffsetX * pixelsPerMm;
-        const pixelOffsetY = mmOffsetY * pixelsPerMm;
+        // FIX 2: IMU EMA FILTERING
+        // Smooth out the high-frequency IMU noise before it reaches the canvas
+        const pixelOffsetX = imuXFilter.current.filter(rawOffsetX);
+        const pixelOffsetY = imuYFilter.current.filter(rawOffsetY);
 
         // 5. Target Calculation (Fusion)
         const targetX = stableX + pixelOffsetX;
         const targetY = stableY + pixelOffsetY;
         
-        // --- 6. ADAPTIVE STABILIZATION (THE DRIFT FIX) ---
-        const dist = Math.hypot(targetX - stabilizedPos.current.x, targetY - stabilizedPos.current.y);
-
+        // FIX 3: FLUID STABILIZATION
+        // Replaced jittery distance checks with a consistent, buttery low-pass lerp.
+        const smoothingAlpha = pen.down ? 0.35 : 0.7; // Smooth ink, fast hover
         let finalX, finalY;
 
-        if (dist < DEADZONE_PX) {
-           finalX = stabilizedPos.current.x;
-           finalY = stabilizedPos.current.y;
+        if (stabilizedPos.current.x === 0 && stabilizedPos.current.y === 0) {
+           finalX = targetX; finalY = targetY; // Initial snap
         } else {
-           const dynamicAlpha = Math.min(SMOOTHING_FAST, Math.max(SMOOTHING_SLOW, (dist / 10)));
-           finalX = lerp(stabilizedPos.current.x, targetX, dynamicAlpha);
-           finalY = lerp(stabilizedPos.current.y, targetY, dynamicAlpha);
+           finalX = lerp(stabilizedPos.current.x, targetX, smoothingAlpha);
+           finalY = lerp(stabilizedPos.current.y, targetY, smoothingAlpha);
         }
 
         stabilizedPos.current = { x: finalX, y: finalY };
